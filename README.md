@@ -80,17 +80,18 @@ what's actually been checked here vs. what hasn't:
   (`docs/CHARGER_QUIRKS.md`, `wb_mqtt.cpp`'s discovery table) — the service/
   characteristic UUIDs, the `st`/`cp`/`en`/`cur` field names, the status
   enum, and the `w_cha` start/stop `par` values are not guesses.
-- ❌ **Not yet compiled** (`esphome compile`) — I installed ESPHome and got
-  as far as ESP-IDF toolchain download in this sandbox, but the PlatformIO
-  package post-install step failed on an unrelated sandbox issue
-  (`package-postinstall.py: command not found` — looks like a PATH/exec
-  quirk in this environment, not a code problem). **Run `esphome compile
-  wallbox.yaml` yourself as the next step** — that's the first real
-  compiler check this code has had.
+- ✅ **Compiles successfully** (`esphome compile wallbox.yaml`, esp32-s3-devkitc-1
+  + esp-idf) — `Successfully compiled program.` RAM 15.5% (50924/327680
+  bytes), Flash 74.3% (1363077/1835008 bytes). If you hit
+  `AttributeError: '_SpecialForm' object has no attribute 'replace'`
+  during the ESP-IDF component-manager step, it's a Python 3.9 /
+  too-new-`pydantic` incompatibility, not a code problem — fix with
+  `~/.platformio/penv/.espidf-5.1.5/bin/python -m pip install "pydantic<2.11"`
+  and re-run.
 - ❌ **Not tested against real hardware** — the PIN handshake, notify
   framing, and field scaling are all correct *on paper* against the
-  upstream project's own documentation, but nothing beats plugging it in.
-  Expect a debugging pass on first boot.
+  upstream project's own documentation, and the firmware now builds clean,
+  but nothing beats plugging it in. Expect a debugging pass on first boot.
 
 ## Known limitations / roadmap
 
