@@ -88,17 +88,25 @@ See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
   Status, Charging/Car Connected binary sensors, Session Energy, Max
   Current, and the power-estimate fallback all updated correctly in real
   time while the car was actually charging.
+- ✅ **Start/stop charging switch tested live** (2026-09-03, over OTA) —
+  round-tripped stop → `st=4` (Paused, `L1` current dropped to 0, real)
+  → start → resumed charging, all reflected correctly end-to-end.
 - ⚠️ **Not yet tested**: the u-blox single-characteristic path (only the
-  Zentri path has been hardware-verified so far), and the write
-  controls — start/stop charging switch and set-max-current number. Only
-  the read/poll path has been exercised live; treat the writes as
-  correct-on-paper until confirmed.
+  Zentri path has been hardware-verified so far), and the set-max-current
+  number. Treat those as correct-on-paper until confirmed.
 - **Fix found during hardware testing**: this charger's firmware answers
   `read_pin` with a BAPI error (`{"error":{"code":4}}`, "feature not
   supported") rather than an empty response. Upstream `esp32-wallbox`
   treats that the same as "no PIN set" (`doc["r"]["pin"]` comes back null
   either way); `handle_response_()` here now does too — see
   `wallbox_ble.cpp`'s PIN-handshake block for the reasoning.
+- **Second fix found during hardware testing**: stopping charging on the
+  Zentri path with `par=2` ("hard stop", correct for MAX/u-blox) came back
+  `{"error":{"code":5}}`. Zentri needs `par=0` ("pause") instead, like
+  Plus/Copper/Quasar — this component now branches on the already-detected
+  service variant. (Mirrors a known bug in `esp32-wallbox` itself:
+  `docs/CHARGER_QUIRKS.md` #10, "Zentri stop-par chosen by config family,
+  not runtime `_isZentri`".)
 
 ## Known limitations / roadmap
 
@@ -114,10 +122,9 @@ See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
   dashboard, not accurate enough for billing, and wrong if your mains
   voltage isn't ~230 V. No dedicated L1/L2/L3 current sensors yet either,
   though `cur` (configured max) is exposed.
-- **`w_cha` stop value (`par=2`, "hard stop") is untested on the Zentri
-  path** — confirmed correct for MAX by upstream docs, but this component's
-  start/stop switch and set-max-current number haven't been exercised
-  live yet on any charger (only reads have).
+- **set-max-current (`w_mxI`) is untested** — the charging switch has been
+  verified live (see Validation status above); the max-current number
+  hasn't been exercised on real hardware yet.
 - **No lock/unlock, reboot, schedules, Eco-Smart/solar mode, or Halo LED
   control.** The BAPI method names for all of these are already in
   `bapi.h` as a starting point (`MET_LOCK`, `MET_SET_ECO_SMART`, etc. — see

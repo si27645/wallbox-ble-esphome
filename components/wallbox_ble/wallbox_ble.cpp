@@ -201,10 +201,13 @@ void WallboxBleHub::stop_charging() {
     ESP_LOGW(TAG, "Not authenticated yet, ignoring stop_charging()");
     return;
   }
-  // par=2 is the Pulsar MAX "hard stop". Plus/Copper/Quasar use par=0
-  // (pause) instead — not distinguished here since this component only
-  // targets MAX for now. See README roadmap.
-  this->write_bapi_(bapi::MET_START_STOP, "2");
+  // par=2 is the Pulsar MAX (u-blox) "hard stop". The Zentri path uses
+  // par=0 (pause) instead, like Plus/Copper/Quasar — confirmed live: par=2
+  // on a Zentri charger comes back {"error":{"code":5}}. This mirrors a
+  // known bug in esp32-wallbox itself (docs/CHARGER_QUIRKS.md #10: "Zentri
+  // stop-par chosen by config family, not runtime _isZentri"); we have the
+  // runtime detection already, so just branch on it directly.
+  this->write_bapi_(bapi::MET_START_STOP, this->zentri_ ? "0" : "2");
 }
 
 void WallboxBleHub::set_max_current(uint8_t amps) {
