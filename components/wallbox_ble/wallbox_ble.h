@@ -29,6 +29,21 @@ static const espbt::ESPBTUUID WALLBOX_SERVICE_UUID =
 static const espbt::ESPBTUUID WALLBOX_CHAR_UUID =
     espbt::ESPBTUUID::from_raw("2456e1b9-26e2-8f83-e744-f34f01e9d703");
 
+// Original (pre-BGX, no-WiFi) Pulsar — a Zentri AMS module running the
+// TruConnect serial-over-BLE profile, not u-blox (MAX) or BGX13P (Plus).
+// Separate write (RX), notify (TX), and mode characteristics, and the mode
+// char must be switched to STREAM_MODE (0x01) before BAPI bytes pass
+// through. Source: si27645/esp32-wallbox `wb_ble.cpp` (Zentri detection/
+// handling around line 556) and `docs/CHARGER_QUIRKS.md`.
+static const espbt::ESPBTUUID ZENTRI_SERVICE_UUID =
+    espbt::ESPBTUUID::from_raw("175f8f23-a570-49bd-9627-815a6a27de2a");
+static const espbt::ESPBTUUID ZENTRI_WRITE_CHAR_UUID =
+    espbt::ESPBTUUID::from_raw("1cce1ea8-bd34-4813-a00a-c76e028fadcb");
+static const espbt::ESPBTUUID ZENTRI_NOTIFY_CHAR_UUID =
+    espbt::ESPBTUUID::from_raw("cacc07ff-ffff-4c48-8fae-a9ef71b75e26");
+static const espbt::ESPBTUUID ZENTRI_MODE_CHAR_UUID =
+    espbt::ESPBTUUID::from_raw("20b9794f-da1a-4d14-8014-a0fb9cefb2f7");
+
 // Charger status codes (r_dat.st), Pulsar MAX / Plus table.
 // Source: si27645/esp32-wallbox `wb_mqtt.cpp` discovery table (entry 8).
 enum WallboxStatus : int {
@@ -106,8 +121,20 @@ class WallboxBleHub : public ble_client::BLEClientNode, public PollingComponent 
   void handle_response_(const std::string &json);
   void report_error_(const std::string &message);
 
+  // Write handle for BAPI commands. Single-char (MAX) mode: also the notify
+  // handle. Zentri (dual-char) mode: the RX char; notify_handle_ is the
+  // separate TX char.
   uint16_t char_handle_{0};
+  uint16_t notify_handle_{0};
   uint16_t config_descr_handle_{0};
+  // Zentri TruConnect only: mode characteristic, switched to STREAM_MODE
+  // once notifications are subscribed so BAPI bytes pass through.
+  uint16_t mode_handle_{0};
+  bool zentri_{false};
+  // Current ATT MTU, tracked from ESP_GATTC_CFG_MTU_EVT. Zentri's AMS
+  // module caps this at the 23-byte default and never negotiates up, so
+  // BAPI frames (~41 B) must be fragmented into (mtu-3) chunks on write.
+  uint16_t mtu_{23};
 
   bapi::ResponseParser parser_;
   std::string pin_;

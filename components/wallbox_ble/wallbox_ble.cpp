@@ -1,13 +1,24 @@
 #ifdef USE_ESP32
 
 #include "wallbox_ble.h"
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "esphome/components/json/json_util.h"
+
+#include <algorithm>
 
 namespace esphome {
 namespace wallbox_ble {
 
 static const char *const TAG = "wallbox_ble";
+
+// Some firmware (confirmed on the original/Zentri Pulsar) omits r_dat's "cp"
+// (charging power) field entirely and reports per-phase current instead
+// (L1/L2/L3, in deciamps — e.g. 58 = 5.8 A). There's no voltage reading in
+// this response, so approximate power as V * sum(phase currents), assuming
+// 230 V single/split-phase mains. This is a rough estimate, not a metered
+// reading — good enough for automations/dashboards, not billing.
+static constexpr float ASSUMED_MAINS_VOLTAGE = 230.0f;
 
 const char *wallbox_status_to_string(int st) {
   switch (st) {
@@ -61,6 +72,9 @@ void WallboxBleHub::dump_config() {
   ESP_LOGCONFIG(TAG, "Wallbox BLE Hub:");
   ESP_LOGCONFIG(TAG, "  MAC address: %s", this->parent()->address_str().c_str());
   ESP_LOGCONFIG(TAG, "  PIN configured: %s", this->pin_.empty() ? "no" : "yes");
+  // BLE service variant (u-blox single-char vs Zentri dual-char) isn't known
+  // until the first connection completes discovery — see the "Zentri
+  // TruConnect peripheral detected" / characteristic-not-found log lines.
 }
 
 void WallboxBleHub::update() {
@@ -71,17 +85,35 @@ void WallboxBleHub::update() {
 // ---- GATT plumbing -------------------------------------------------------
 
 bool WallboxBleHub::discover_characteristic_() {
+  // Try the Pulsar MAX single-characteristic (u-blox) service first.
   auto *chr = this->parent()->get_characteristic(WALLBOX_SERVICE_UUID, WALLBOX_CHAR_UUID);
-  if (chr == nullptr) {
-    ESP_LOGW(TAG, "BAPI characteristic not found — is this a Pulsar MAX? Plus/Copper/Quasar use a "
-                  "different (dual-characteristic) service, not yet supported by this component.");
-    return false;
-  }
-  this->char_handle_ = chr->handle;
+  if (chr != nullptr) {
+    this->char_handle_ = chr->handle;
+    this->notify_handle_ = chr->handle;
+    this->zentri_ = false;
+  } else {
+    // Fall back to the Zentri TruConnect (original, no-WiFi Pulsar)
+    // dual-characteristic service.
+    auto *write_chr = this->parent()->get_characteristic(ZENTRI_SERVICE_UUID, ZENTRI_WRITE_CHAR_UUID);
+    auto *notify_chr = this->parent()->get_characteristic(ZENTRI_SERVICE_UUID, ZENTRI_NOTIFY_CHAR_UUID);
+    if (write_chr == nullptr || notify_chr == nullptr) {
+      ESP_LOGW(TAG, "BAPI characteristic not found — neither the Pulsar MAX (u-blox) nor the original "
+                    "Pulsar (Zentri TruConnect) service is present. Plus/Copper/Quasar use a different "
+                    "BGX-based service, not yet supported by this component.");
+      return false;
+    }
+    this->char_handle_ = write_chr->handle;
+    this->notify_handle_ = notify_chr->handle;
+    this->zentri_ = true;
+    ESP_LOGI(TAG, "Zentri TruConnect peripheral detected (dual-characteristic mode).");
 
-  auto *descr = this->parent()->get_config_descriptor(this->char_handle_);
+    auto *mode_chr = this->parent()->get_characteristic(ZENTRI_SERVICE_UUID, ZENTRI_MODE_CHAR_UUID);
+    this->mode_handle_ = mode_chr != nullptr ? mode_chr->handle : 0;
+  }
+
+  auto *descr = this->parent()->get_config_descriptor(this->notify_handle_);
   if (descr == nullptr) {
-    ESP_LOGW(TAG, "No CCCD found for the BAPI characteristic — can't subscribe to notifications.");
+    ESP_LOGW(TAG, "No CCCD found for the BAPI notify characteristic — can't subscribe to notifications.");
     return false;
   }
   this->config_descr_handle_ = descr->handle;
@@ -90,7 +122,7 @@ bool WallboxBleHub::discover_characteristic_() {
 
 bool WallboxBleHub::register_for_notify_() {
   auto status = esp_ble_gattc_register_for_notify(this->parent()->get_gattc_if(), this->parent()->get_remote_bda(),
-                                                   this->char_handle_);
+                                                   this->notify_handle_);
   if (status) {
     ESP_LOGW(TAG, "esp_ble_gattc_register_for_notify failed, status=%d", status);
   }
@@ -114,12 +146,39 @@ void WallboxBleHub::write_bapi_(const char *met, const std::string &par) {
   std::string cmd = bapi::build_cmd(met, par.c_str(), id);
   std::string frame = bapi::frame(cmd);
 
-  auto status = esp_ble_gattc_write_char(
-      this->parent()->get_gattc_if(), this->parent()->get_conn_id(), this->char_handle_, frame.size(),
-      (uint8_t *) frame.data(), ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
-  if (status) {
-    ESP_LOGW(TAG, "Write '%s' failed, status=%d", met, status);
+  // On a small-MTU link (Zentri: capped at the 23-byte ATT default) a BAPI
+  // frame (~41 B) can exceed the single-write payload (mtu-3). Fragment into
+  // (mtu-3) chunks with write-no-response — the TruConnect module reassembles
+  // the byte stream, same as a plain serial link. MAX (MTU 247) never hits
+  // this path. Source: si27645/esp32-wallbox `wb_ble.cpp` _sendCommandDirect.
+  size_t max_chunk = this->mtu_ > 3 ? (size_t) (this->mtu_ - 3) : 20;
+  const uint8_t *data = (const uint8_t *) frame.data();
+  size_t len = frame.size();
+
+  if (len <= max_chunk) {
+    auto status = esp_ble_gattc_write_char(
+        this->parent()->get_gattc_if(), this->parent()->get_conn_id(), this->char_handle_, len, (uint8_t *) data,
+        ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+    if (status) {
+      ESP_LOGW(TAG, "Write '%s' failed, status=%d", met, status);
+    }
+    return;
   }
+
+  size_t off = 0;
+  while (off < len) {
+    size_t n = std::min(max_chunk, len - off);
+    auto status = esp_ble_gattc_write_char(
+        this->parent()->get_gattc_if(), this->parent()->get_conn_id(), this->char_handle_, n,
+        (uint8_t *) (data + off), ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+    if (status) {
+      ESP_LOGW(TAG, "Fragmented write '%s' failed at offset %zu, status=%d", met, off, status);
+      return;
+    }
+    off += n;
+    if (off < len) delay(8);  // let the controller TX buffer drain between chunks
+  }
+  ESP_LOGD(TAG, "TX %s fragmented: %zu bytes in %zu-byte chunks (mtu=%u)", met, len, max_chunk, this->mtu_);
 }
 
 void WallboxBleHub::begin_authenticate_() {
@@ -169,15 +228,23 @@ void WallboxBleHub::handle_response_(const std::string &json) {
   bool parsed_ok = json::parse_json(json, [this](JsonObject root) -> bool {
     int id = root["id"] | -1;
 
-    if (root["error"].is<JsonObject>()) {
-      std::string msg = root["error"]["message"] | std::string("unknown BAPI error");
-      this->report_error_(msg);
-      return true;
-    }
-
     // ---- PIN handshake ----
+    // Checked before the generic error handler below: on firmware that
+    // doesn't implement `read_pin` at all (e.g. the original/Zentri Pulsar),
+    // the charger answers with a BAPI error (commonly code 4, "feature not
+    // supported") rather than an empty response. Upstream esp32-wallbox
+    // treats that identically to "no PIN set" — doc["r"]["pin"] comes back
+    // null either way (missing "r" key) — so mirror that here instead of
+    // reporting it as a persistent error.
     if (id == this->pending_read_pin_id_) {
       this->pending_read_pin_id_ = -1;
+      if (root["error"].is<JsonObject>()) {
+        int code = root["error"]["code"] | -1;
+        ESP_LOGI(TAG, "read_pin not supported by this firmware (error code %d) — proceeding unauthenticated.",
+                 code);
+        this->authenticated_ = true;
+        return true;
+      }
       const char *pin = root["r"]["pin"] | (const char *) nullptr;
       if (pin == nullptr || pin[0] == '\0') {
         ESP_LOGI(TAG, "Charger has no BAPI PIN set — proceeding unauthenticated.");
@@ -197,8 +264,19 @@ void WallboxBleHub::handle_response_(const std::string &json) {
     }
     if (id == this->pending_set_pin_id_) {
       this->pending_set_pin_id_ = -1;
+      if (root["error"].is<JsonObject>()) {
+        std::string msg = root["error"]["message"] | std::string("unknown BAPI error");
+        this->report_error_("PIN authentication failed: " + msg);
+        return true;
+      }
       ESP_LOGI(TAG, "PIN authenticated.");
       this->authenticated_ = true;
+      return true;
+    }
+
+    if (root["error"].is<JsonObject>()) {
+      std::string msg = root["error"]["message"] | std::string("unknown BAPI error");
+      this->report_error_(msg);
       return true;
     }
 
@@ -217,8 +295,14 @@ void WallboxBleHub::handle_response_(const std::string &json) {
       if (this->car_connected_sensor_ != nullptr) {
         this->car_connected_sensor_->publish_state(wallbox_status_car_connected(st));
       }
-      if (this->power_sensor_ != nullptr && r["cp"].is<float>()) {
-        this->power_sensor_->publish_state(r["cp"].as<float>());
+      if (this->power_sensor_ != nullptr) {
+        if (r["cp"].is<float>()) {
+          this->power_sensor_->publish_state(r["cp"].as<float>());
+        } else if (r["L1"].is<int>() || r["L2"].is<int>() || r["L3"].is<int>()) {
+          float deciamps = (r["L1"] | 0) + (r["L2"] | 0) + (r["L3"] | 0);
+          // Sensor unit is kW (matches "cp" above) — watts / 1000.
+          this->power_sensor_->publish_state((deciamps / 10.0f) * ASSUMED_MAINS_VOLTAGE / 1000.0f);
+        }
       }
       if (this->energy_sensor_ != nullptr && r["en"].is<float>()) {
         // r_dat.en is centi-kWh (see docs/CHARGER_QUIRKS.md in the
@@ -249,7 +333,15 @@ void WallboxBleHub::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
       this->authenticated_ = false;
       this->pin_required_ = false;
       this->char_handle_ = 0;
+      this->notify_handle_ = 0;
+      this->mode_handle_ = 0;
+      this->zentri_ = false;
+      this->mtu_ = 23;
       this->parser_.reset();
+      break;
+    }
+    case ESP_GATTC_CFG_MTU_EVT: {
+      this->mtu_ = param->cfg_mtu.mtu;
       break;
     }
     case ESP_GATTC_SEARCH_CMPL_EVT: {
@@ -262,20 +354,36 @@ void WallboxBleHub::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
       break;
     }
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
-      if (param->reg_for_notify.handle != this->char_handle_) break;
+      if (param->reg_for_notify.handle != this->notify_handle_) break;
       // Mirrors ESPHome's `bedjet` component: once node_state is
       // ESTABLISHED the parent BLEClient purges its cached handle/
       // descriptor table, so the CCCD write has to happen here rather
       // than relying on BLEClient's own (now-gone) bookkeeping.
       this->write_notify_config_descriptor_(true);
-      ESP_LOGD(TAG, "Subscribed to BAPI notifications, starting PIN handshake.");
+      ESP_LOGD(TAG, "Subscribed to BAPI notifications.");
+
+      if (this->zentri_ && this->mode_handle_ != 0) {
+        // Switch the Zentri TruConnect module to STREAM_MODE (0x01) so it
+        // passes BAPI bytes through transparently instead of swallowing
+        // them as module commands. Source: esp32-wallbox `wb_ble.cpp`.
+        uint8_t stream_mode = 0x01;
+        esp_ble_gattc_write_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), this->mode_handle_,
+                                  1, &stream_mode, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+        ESP_LOGD(TAG, "Zentri: sent STREAM_MODE switch.");
+        delay(200);  // let the module honour the mode change before first write
+      }
+
+      ESP_LOGD(TAG, "Starting PIN handshake.");
       this->parser_.reset();
       this->begin_authenticate_();
       break;
     }
     case ESP_GATTC_NOTIFY_EVT: {
-      if (param->notify.handle != this->char_handle_) break;
+      if (param->notify.handle != this->notify_handle_) break;
+      ESP_LOGVV(TAG, "RX notify chunk (%u bytes): %.*s", param->notify.value_len, param->notify.value_len,
+                (const char *) param->notify.value);
       if (this->parser_.feed(param->notify.value, param->notify.value_len)) {
+        ESP_LOGD(TAG, "RX: %s", this->parser_.json_string().c_str());
         this->handle_response_(this->parser_.json_string());
         this->parser_.reset();
       }

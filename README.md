@@ -5,6 +5,12 @@ protocol) directly to a **Wallbox Pulsar MAX**, exposing charging power,
 session energy, status, and start/stop/max-current control as native
 ESPHome/Home Assistant entities — no MQTT broker, no cloud.
 
+Two BLE service variants are supported, auto-detected at connect time:
+the u-blox single-characteristic service most Pulsar MAX units use, and
+the Zentri TruConnect dual-characteristic service used by the original
+(pre-BGX, no-WiFi) Pulsar. Plus/Copper/Quasar's BGX-based service is not
+supported yet.
+
 This is a **from-scratch rewrite** of the BLE core of
 [si27645/esp32-wallbox](https://github.com/si27645/esp32-wallbox) (a fork of
 [botts7/esp32-wallbox](https://github.com/botts7/esp32-wallbox)) against
@@ -38,7 +44,7 @@ dashboard for native HA integration:
 
 | Platform | Key | Description |
 |---|---|---|
-| `sensor` | `power` | Charging power (kW) |
+| `sensor` | `power` | Charging power (kW) — from `r_dat.cp` where the firmware reports it; on firmware that instead reports per-phase current (`L1/L2/L3`, no `cp`), estimated as `sum(phases) × 230 V`. See "Known limitations" below. |
 | `sensor` | `energy` | Session energy (kWh) |
 | `sensor` | `max_current` | Charger-reported max current (A) |
 | `binary_sensor` | `car_connected` | A car is plugged in |
@@ -54,8 +60,12 @@ See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
 
 1. Find your charger's BLE MAC address (nRF Connect app, or
    `bluetoothctl scan on` near the charger).
-2. Copy `example/wallbox.yaml`, set `wallbox_mac`, add your WiFi
-   credentials to `secrets.yaml`.
+2. Copy `example/wallbox.yaml`, set `wallbox_mac`, `esp32.board` (defaults
+   to a generic `esp32dev`; change it to match your actual dev board —
+   e.g. `esp32-s3-devkitc-1` for an S3), and add your WiFi credentials to
+   `secrets.yaml`. If your WiFi network is hidden (doesn't show up in a
+   scan), keep `fast_connect: true` under `wifi:`; ESPHome's default
+   scan-and-match otherwise never finds it.
 3. If you've set a Bluetooth PIN on the charger (Wallbox app → Settings),
    add it as `pin:` under `wallbox_ble:` (via `!secret`, not committed in
    plain text).
@@ -63,42 +73,51 @@ See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
 
 ## Validation status — read this first
 
-I don't have a physical Pulsar MAX to test against, so be clear-eyed about
-what's actually been checked here vs. what hasn't:
-
-- ✅ **ESPHome config validation passes** (`esphome config wallbox.yaml` →
-  `Configuration is valid!`) — the YAML schema, Python codegen, and every
-  class/method name referenced between the `.py` files and the C++ headers
-  are internally consistent.
-- ✅ **C++ source generation succeeds** — ESPHome's codegen renders valid
-  C++ from the config with no errors.
-- ✅ **BLE API usage is grounded in real, current ESPHome source** — the
-  `gattc_event_handler`/`register_for_notify`/`write_char_descr` sequence
-  in `wallbox_ble.cpp` mirrors ESPHome's own `bedjet` component
-  line-for-line in structure, not guessed from documentation.
-- ✅ **Protocol constants are sourced from the upstream repo's own docs**
-  (`docs/CHARGER_QUIRKS.md`, `wb_mqtt.cpp`'s discovery table) — the service/
-  characteristic UUIDs, the `st`/`cp`/`en`/`cur` field names, the status
-  enum, and the `w_cha` start/stop `par` values are not guesses.
-- ✅ **Compiles successfully** (`esphome compile wallbox.yaml`, esp32-s3-devkitc-1
-  + esp-idf) — `Successfully compiled program.` RAM 15.5% (50924/327680
-  bytes), Flash 74.3% (1363077/1835008 bytes). If you hit
-  `AttributeError: '_SpecialForm' object has no attribute 'replace'`
-  during the ESP-IDF component-manager step, it's a Python 3.9 /
-  too-new-`pydantic` incompatibility, not a code problem — fix with
+- ✅ **Compiles cleanly** (`esphome compile wallbox.yaml`, esp32dev + esp-idf)
+  — RAM 15.5%, Flash 74.3%. If you hit `AttributeError: '_SpecialForm'
+  object has no attribute 'replace'` during the ESP-IDF component-manager
+  step, it's a Python 3.9 / too-new-`pydantic` incompatibility, not a code
+  problem — fix with
   `~/.platformio/penv/.espidf-5.1.5/bin/python -m pip install "pydantic<2.11"`
   and re-run.
-- ❌ **Not tested against real hardware** — the PIN handshake, notify
-  framing, and field scaling are all correct *on paper* against the
-  upstream project's own documentation, and the firmware now builds clean,
-  but nothing beats plugging it in. Expect a debugging pass on first boot.
+- ✅ **Tested live against a real charger** (2026-09-02/03, generic ESP32
+  DevKitC + an original/no-WiFi Pulsar on the Zentri TruConnect service).
+  Confirmed working end-to-end: BLE connect, service auto-detection,
+  STREAM_MODE switch, PIN-handshake fallback (this firmware doesn't
+  implement `read_pin` at all — see below), and live polling — Charger
+  Status, Charging/Car Connected binary sensors, Session Energy, Max
+  Current, and the power-estimate fallback all updated correctly in real
+  time while the car was actually charging.
+- ⚠️ **Not yet tested**: the u-blox single-characteristic path (only the
+  Zentri path has been hardware-verified so far), and the write
+  controls — start/stop charging switch and set-max-current number. Only
+  the read/poll path has been exercised live; treat the writes as
+  correct-on-paper until confirmed.
+- **Fix found during hardware testing**: this charger's firmware answers
+  `read_pin` with a BAPI error (`{"error":{"code":4}}`, "feature not
+  supported") rather than an empty response. Upstream `esp32-wallbox`
+  treats that the same as "no PIN set" (`doc["r"]["pin"]` comes back null
+  either way); `handle_response_()` here now does too — see
+  `wallbox_ble.cpp`'s PIN-handshake block for the reasoning.
 
 ## Known limitations / roadmap
 
-- **Pulsar MAX only.** Plus/Copper/Quasar/Quasar2 use a different
-  dual-characteristic BLE service and a different `w_cha` stop value
-  (`par=0` pause, not `par=2` hard-stop) — see upstream's
-  `docs/CHARGER_QUIRKS.md` for the full model matrix. Not implemented here.
+- **Pulsar (MAX and original/Zentri) only.** Plus/Copper/Quasar/Quasar2 use
+  a different, BGX-based dual-characteristic BLE service and a different
+  `w_cha` stop value (`par=0` pause, not `par=2` hard-stop) — see
+  upstream's `docs/CHARGER_QUIRKS.md` for the full model matrix. Not
+  implemented here.
+- **Charging Power is estimated, not metered, on firmware without `cp`.**
+  Confirmed on the Zentri-path charger tested: `r_dat` reports per-phase
+  current (`L1/L2/L3`, deciamps) instead of a power field. The fallback
+  computes `sum(phases)/10 × 230 V` — a reasonable approximation for a
+  dashboard, not accurate enough for billing, and wrong if your mains
+  voltage isn't ~230 V. No dedicated L1/L2/L3 current sensors yet either,
+  though `cur` (configured max) is exposed.
+- **`w_cha` stop value (`par=2`, "hard stop") is untested on the Zentri
+  path** — confirmed correct for MAX by upstream docs, but this component's
+  start/stop switch and set-max-current number haven't been exercised
+  live yet on any charger (only reads have).
 - **No lock/unlock, reboot, schedules, Eco-Smart/solar mode, or Halo LED
   control.** The BAPI method names for all of these are already in
   `bapi.h` as a starting point (`MET_LOCK`, `MET_SET_ECO_SMART`, etc. — see
@@ -110,8 +129,6 @@ what's actually been checked here vs. what hasn't:
 - **No async command-response matching for writes** — writes are
   fire-and-forget; state is optimistic until the next poll. Fine for a
   personal charger, would need work for anything more demanding.
-- No dual-phase / three-phase current sensors (L1/L2/L3) yet, though
-  `cur` (configured max) is exposed.
 
 ## Credits
 
