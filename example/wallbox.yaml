@@ -1,0 +1,81 @@
+substitutions:
+  name: wallbox-gateway
+  friendly_name: "Wallbox Gateway"
+  # Find yours: nRF Connect app, or `bluetoothctl scan on` near the charger.
+  wallbox_mac: "AA:BB:CC:DD:EE:FF"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+
+logger:
+api:
+ota:
+  platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+captive_portal:
+
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: ${wallbox_mac}
+    id: wallbox_ble_client
+
+wallbox_ble:
+  id: my_wallbox
+  ble_client_id: wallbox_ble_client
+  update_interval: 10s
+  # Only needed if the charger has a Bluetooth PIN set (Wallbox app >
+  # Settings). Store it in secrets.yaml, not committed in plain text.
+  # pin: !secret wallbox_pin
+
+sensor:
+  - platform: wallbox_ble
+    wallbox_ble_id: my_wallbox
+    power:
+      name: "Charging Power"
+    energy:
+      name: "Session Energy"
+    max_current:
+      name: "Max Current (reported)"
+
+binary_sensor:
+  - platform: wallbox_ble
+    wallbox_ble_id: my_wallbox
+    car_connected:
+      name: "Car Connected"
+    charging:
+      name: "Charging"
+
+text_sensor:
+  - platform: wallbox_ble
+    wallbox_ble_id: my_wallbox
+    status:
+      name: "Charger Status"
+    last_error:
+      name: "Last BAPI Error"
+
+switch:
+  - platform: wallbox_ble
+    wallbox_ble_id: my_wallbox
+    charging:
+      name: "Charging Enabled"
+
+number:
+  - platform: wallbox_ble
+    wallbox_ble_id: my_wallbox
+    max_current:
+      name: "Set Max Current"
