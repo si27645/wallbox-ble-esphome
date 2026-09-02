@@ -64,6 +64,22 @@ bool wallbox_status_car_connected(int st) {
   }
 }
 
+const char *wallbox_eco_mode_to_string(int mode) {
+  switch (mode) {
+    case ECO_MODE_DISABLED: return "Disabled";
+    case ECO_MODE_FULL_GREEN: return "Full Green";
+    case ECO_MODE_SOLAR_GRID: return "Solar + Grid";
+    default: return "Unknown";
+  }
+}
+
+int wallbox_eco_mode_from_string(const std::string &option) {
+  if (option == "Disabled") return ECO_MODE_DISABLED;
+  if (option == "Full Green") return ECO_MODE_FULL_GREEN;
+  if (option == "Solar + Grid") return ECO_MODE_SOLAR_GRID;
+  return -1;
+}
+
 void WallboxBleHub::setup() {
   this->parser_.reset();
 }
@@ -80,6 +96,15 @@ void WallboxBleHub::dump_config() {
 void WallboxBleHub::update() {
   if (!this->is_connected() || !this->authenticated_) return;
   this->write_bapi_(bapi::MET_GET_STATUS);
+  // g_ecos is fired as a follow-up from handle_response_() once r_dat's
+  // response arrives — not here. Firing both writes back-to-back let their
+  // responses land in the same BLE notify burst; ResponseParser::feed()
+  // returns as soon as one top-level JSON object completes and drops
+  // whatever's left in that chunk (the start of the next response),
+  // silently losing it. Never have two BAPI requests in flight at once.
+  if (this->eco_mode_select_ != nullptr) {
+    this->eco_poll_due_ = true;
+  }
 }
 
 // ---- GATT plumbing -------------------------------------------------------
@@ -218,6 +243,27 @@ void WallboxBleHub::set_max_current(uint8_t amps) {
   this->write_bapi_(bapi::MET_SET_CURRENT, std::to_string(amps));
 }
 
+void WallboxBleHub::set_eco_mode(int mode) {
+  if (!this->authenticated_) {
+    ESP_LOGW(TAG, "Not authenticated yet, ignoring set_eco_mode()");
+    return;
+  }
+  if (mode <= ECO_MODE_DISABLED) {
+    // The charger ignores an `esm` change that arrives together with
+    // `ese=0` in the same write, leaving `esm` stuck at its previous value
+    // (reads back as a phantom mode). Two-step per esp32-wallbox
+    // `wb_mqtt.cpp`: send the mode-clear with the master flag still on
+    // (accepted), then drop the flag in a second write.
+    this->write_bapi_(bapi::MET_SET_ECO_SMART, "{\"esm\":0,\"ese\":1,\"esp\":100}");
+    this->write_bapi_(bapi::MET_SET_ECO_SMART, "{\"esm\":0,\"ese\":0,\"esp\":100}");
+  } else {
+    // esp (solar power target %) isn't exposed as its own entity yet —
+    // matches esp32-wallbox's own eco_mode write, which always sends 100.
+    std::string par = "{\"esm\":" + std::to_string(mode) + ",\"ese\":1,\"esp\":100}";
+    this->write_bapi_(bapi::MET_SET_ECO_SMART, par);
+  }
+}
+
 // ---- Response handling -----------------------------------------------
 
 void WallboxBleHub::report_error_(const std::string &message) {
@@ -276,6 +322,27 @@ void WallboxBleHub::handle_response_(const std::string &json) {
       this->authenticated_ = true;
       return true;
     }
+    if (id == this->pending_eco_poll_id_) {
+      this->pending_eco_poll_id_ = -1;
+      if (root["error"].is<JsonObject>()) {
+        // Not fatal, and not necessarily worth alarming over — e.g. this
+        // firmware may simply not support Eco-Smart over BLE at all
+        // (confirmed on a Zentri-path charger: error code 4, "feature not
+        // supported", matching esp32-wallbox's own CHARGER_QUIRKS.md note
+        // that Zentri "typically" lacks it). Log once at debug rather than
+        // spamming the Last BAPI Error sensor every poll cycle.
+        ESP_LOGD(TAG, "g_ecos error (code %d) — Eco Mode select won't update this cycle.",
+                 (int) (root["error"]["code"] | -1));
+        return true;
+      }
+      if (this->eco_mode_select_ != nullptr) {
+        JsonObject r = root["r"];
+        bool ese = r["ese"] | false;
+        int esm = r["esm"] | 0;
+        this->eco_mode_select_->publish_state(wallbox_eco_mode_to_string(wallbox_eco_mode_of(ese, esm)));
+      }
+      return true;
+    }
 
     if (root["error"].is<JsonObject>()) {
       std::string msg = root["error"]["message"] | std::string("unknown BAPI error");
@@ -318,6 +385,15 @@ void WallboxBleHub::handle_response_(const std::string &json) {
           this->max_current_sensor_->publish_state(this->last_cur_);
         }
       }
+
+      // Fire the eco-mode poll now that r_dat's response is fully consumed
+      // — see update()/eco_poll_due_ for why this can't just fire alongside
+      // r_dat itself.
+      if (this->eco_poll_due_) {
+        this->eco_poll_due_ = false;
+        this->pending_eco_poll_id_ = this->next_id_;
+        this->write_bapi_(bapi::MET_GET_ECO_SMART);
+      }
     }
     return true;
   });
@@ -340,6 +416,7 @@ void WallboxBleHub::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
       this->mode_handle_ = 0;
       this->zentri_ = false;
       this->mtu_ = 23;
+      this->eco_poll_due_ = false;
       this->parser_.reset();
       break;
     }

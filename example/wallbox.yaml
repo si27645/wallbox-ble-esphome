@@ -80,3 +80,9 @@ number:
     wallbox_ble_id: my_wallbox
     max_current:
       name: "Set Max Current"
+
+select:
+  - platform: wallbox_ble
+    wallbox_ble_id: my_wallbox
+    eco_mode:
+      name: "Eco Mode"

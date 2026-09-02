@@ -8,6 +8,7 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/components/select/select.h"
 
 #include "bapi.h"
 
@@ -76,6 +77,24 @@ const char *wallbox_status_to_string(int st);
 // under-report car-connected. See README roadmap.
 bool wallbox_status_car_connected(int st);
 
+// Eco-Smart mode (g_ecos/s_ecos `esm`, gated by `ese`). Source:
+// si27645/esp32-wallbox `wb_mqtt.cpp` (kEcoOptions) and `wb_web.cpp`
+// (g_ecos display table). The displayed mode is 0 whenever `ese` is
+// false, regardless of the last `esm` value — see wallbox_eco_mode_of().
+enum WallboxEcoMode : int {
+  ECO_MODE_DISABLED = 0,
+  ECO_MODE_FULL_GREEN = 1,   // solar only
+  ECO_MODE_SOLAR_GRID = 2,   // solar + grid top-up
+};
+
+const char *wallbox_eco_mode_to_string(int mode);
+// -1 if `option` isn't one of wallbox_eco_mode_to_string()'s strings.
+int wallbox_eco_mode_from_string(const std::string &option);
+// g_ecos reports {ese, esm, esp} separately; the *displayed* mode is 0
+// (Disabled) whenever ese is false, whatever esm last was — mirrors
+// esp32-wallbox `wb_ble.cpp`: merged["eco_mode"] = ese ? esm : 0.
+inline int wallbox_eco_mode_of(bool ese, int esm) { return ese ? esm : 0; }
+
 class WallboxBleHub : public ble_client::BLEClientNode, public PollingComponent {
  public:
   void setup() override;
@@ -96,11 +115,16 @@ class WallboxBleHub : public ble_client::BLEClientNode, public PollingComponent 
   void set_max_current_sensor(sensor::Sensor *s) { this->max_current_sensor_ = s; }
   void set_status_text_sensor(text_sensor::TextSensor *s) { this->status_text_sensor_ = s; }
   void set_last_error_text_sensor(text_sensor::TextSensor *s) { this->last_error_text_sensor_ = s; }
+  // Setting this also enables periodic g_ecos polling in update() — see
+  // there. Left null (the default), Eco-Smart isn't polled at all, so
+  // configs that don't use it don't pay the extra BLE round-trip.
+  void set_eco_mode_select(select::Select *s) { this->eco_mode_select_ = s; }
 
-  // --- Controls, called by the switch/number platforms ---
+  // --- Controls, called by the switch/number/select platforms ---
   void start_charging();
   void stop_charging();
   void set_max_current(uint8_t amps);
+  void set_eco_mode(int mode);
 
   // Last known values — read by switch/number for optimistic state after
   // a write, ahead of the next poll confirming it.
@@ -135,6 +159,10 @@ class WallboxBleHub : public ble_client::BLEClientNode, public PollingComponent 
   // module caps this at the 23-byte default and never negotiates up, so
   // BAPI frames (~41 B) must be fragmented into (mtu-3) chunks on write.
   uint16_t mtu_{23};
+  // Set by update() when an eco-mode poll is wanted; consumed by
+  // handle_response_() once r_dat's response comes back, so g_ecos is
+  // never in flight at the same time as another request — see update().
+  bool eco_poll_due_{false};
 
   bapi::ResponseParser parser_;
   std::string pin_;
@@ -145,6 +173,7 @@ class WallboxBleHub : public ble_client::BLEClientNode, public PollingComponent 
   // async via notify rather than as a return value.
   int pending_read_pin_id_{-1};
   int pending_set_pin_id_{-1};
+  int pending_eco_poll_id_{-1};
 
   int last_status_{-1};
   uint8_t last_cur_{0};
@@ -156,6 +185,7 @@ class WallboxBleHub : public ble_client::BLEClientNode, public PollingComponent 
   sensor::Sensor *max_current_sensor_{nullptr};
   text_sensor::TextSensor *status_text_sensor_{nullptr};
   text_sensor::TextSensor *last_error_text_sensor_{nullptr};
+  select::Select *eco_mode_select_{nullptr};
 };
 
 }  // namespace wallbox_ble

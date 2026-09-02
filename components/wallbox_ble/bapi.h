@@ -53,11 +53,13 @@ class ResponseParser {
 // Read
 constexpr const char *MET_GET_STATUS = "r_dat";  // main status: st, cp, en, cur, L1-L3...
 constexpr const char *MET_READ_PIN = "read_pin";
+constexpr const char *MET_GET_ECO_SMART = "g_ecos";  // eco-smart config: {ese,esm,esp}
 
 // Write
 constexpr const char *MET_START_STOP = "w_cha";   // par=1 start, par=2 stop (MAX)
 constexpr const char *MET_SET_CURRENT = "w_mxI";  // par=<amps>
 constexpr const char *MET_SET_PIN = "set_pin";    // par={"pin":"...","version":n}
+constexpr const char *MET_SET_ECO_SMART = "s_ecos";  // par={"esm":n,"ese":0|1,"esp":0-100}
 
 }  // namespace bapi
 }  // namespace wallbox_ble

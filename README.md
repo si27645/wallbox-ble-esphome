@@ -53,6 +53,7 @@ dashboard for native HA integration:
 | `text_sensor` | `last_error` | Last BAPI error message, for diagnostics |
 | `switch` | `charging` | Start/stop charging |
 | `number` | `max_current` | Set max charging current, 6–32 A |
+| `select` | `eco_mode` | Eco-Smart mode: Disabled / Full Green / Solar + Grid (`g_ecos`/`s_ecos`). Not supported by every charger — see "Known limitations" below. |
 
 See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
 
@@ -107,6 +108,30 @@ See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
   service variant. (Mirrors a known bug in `esp32-wallbox` itself:
   `docs/CHARGER_QUIRKS.md` #10, "Zentri stop-par chosen by config family,
   not runtime `_isZentri`".)
+- **Third fix found during hardware testing (real, not hypothetical)**:
+  `ResponseParser::feed()` returns as soon as one top-level JSON object
+  completes, discarding whatever's left in that BLE notify chunk. Firing
+  two BAPI requests back-to-back (the initial `eco_mode` implementation
+  did this: `r_dat` + `g_ecos` every update cycle) let their responses
+  land in the same notify burst — the second response got silently
+  dropped, and on a couple of cycles the *first* response was itself
+  corrupted (a captured `r_dat` came back as `"L1":0,"L":4` — a lost byte
+  from the previous response's tail bleeding across the `reset()`
+  boundary). Fixed by never having two requests in flight at once: `update()`
+  sends only `r_dat`, and chains `g_ecos` as a follow-up from inside its
+  response handler. **This is a real, general risk any time two writes
+  fire close together** (e.g. `set_eco_mode()`'s two-step disable write) —
+  it's contained for polling now, but not eliminated everywhere; see
+  "No async command-response matching for writes" below.
+- **Eco-Smart mode (`select.eco_mode`) is wired to the real protocol but
+  confirmed NOT supported on the Zentri-path charger tested** —
+  `g_ecos` consistently returns `{"error":{"code":4}}` ("feature not
+  supported"), matching `esp32-wallbox`'s own `docs/CHARGER_QUIRKS.md`
+  ("Eco-Smart/Solar: … typically none" for Zentri). Handled gracefully
+  (logged at debug, not reported as an error; the select just stays
+  unknown) rather than silently doing nothing. **Untested on MAX/Plus**,
+  which the same docs say support it "if meter" — the code should work
+  there but hasn't been verified against that hardware.
 
 ## Known limitations / roadmap
 
@@ -125,17 +150,24 @@ See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
 - **set-max-current (`w_mxI`) is untested** — the charging switch has been
   verified live (see Validation status above); the max-current number
   hasn't been exercised on real hardware yet.
-- **No lock/unlock, reboot, schedules, Eco-Smart/solar mode, or Halo LED
-  control.** The BAPI method names for all of these are already in
-  `bapi.h` as a starting point (`MET_LOCK`, `MET_SET_ECO_SMART`, etc. — see
-  the fuller list in the upstream repo's `include/bapi.h`), they're just
-  not wired to entities yet.
+- **No lock/unlock, reboot, schedules, or Halo LED control.** (Eco-Smart
+  mode is now implemented — see Entities above — though confirmed
+  unsupported on the one charger this has been tested against.) The BAPI
+  method names for the rest are a starting point in the upstream repo's
+  `include/bapi.h`; not wired to entities here yet.
 - **`car_connected` under-reports when status is `Locked` (code 6).** The
   upstream project disambiguates this by cross-checking `r_sta.charger_status`,
   which this component doesn't poll yet.
-- **No async command-response matching for writes** — writes are
-  fire-and-forget; state is optimistic until the next poll. Fine for a
-  personal charger, would need work for anything more demanding.
+- **No async command-response matching for writes, and no write
+  serialization** — writes are fire-and-forget; state is optimistic until
+  the next poll. Beyond the "no ack" gap, firing two requests close
+  together (any write immediately followed by another, or by a poll) can
+  interleave their responses in the same BLE notify burst and corrupt or
+  lose one of them — see the parser bug in Validation status above.
+  `update()`'s own polling is now safe (sequenced deliberately), but
+  nothing stops a user-triggered write from racing a poll response. Fine
+  for a personal charger with occasional manual control; would need a
+  real request queue for anything more demanding.
 
 ## Credits
 
