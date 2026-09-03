@@ -92,9 +92,15 @@ See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
 - ✅ **Start/stop charging switch tested live** (2026-09-03, over OTA) —
   round-tripped stop → `st=4` (Paused, `L1` current dropped to 0, real)
   → start → resumed charging, all reflected correctly end-to-end.
-- ⚠️ **Not yet tested**: the u-blox single-characteristic path (only the
-  Zentri path has been hardware-verified so far), and the set-max-current
-  number. Treat those as correct-on-paper until confirmed.
+- ✅ **Set-max-current number tested live** (2026-09-03) — writing `8`
+  got `{"r":null}` (accepted) and the next poll confirmed both `cur:8`
+  *and* real current draw dropping proportionally (`L1` 101→80). This
+  directly contradicts `esp32-wallbox`'s own `docs/CHARGER_QUIRKS.md`,
+  which claims the Zentri path "can't set current over BLE" — at least on
+  this charger's firmware, it works fine.
+- ⚠️ **Not yet tested**: the u-blox single-characteristic path — only the
+  Zentri path has been hardware-verified so far. Treat u-blox as
+  correct-on-paper until confirmed against a real MAX-family charger.
 - **Fix found during hardware testing**: this charger's firmware answers
   `read_pin` with a BAPI error (`{"error":{"code":4}}`, "feature not
   supported") rather than an empty response. Upstream `esp32-wallbox`
@@ -147,9 +153,6 @@ See [`example/wallbox.yaml`](example/wallbox.yaml) for a full working config.
   dashboard, not accurate enough for billing, and wrong if your mains
   voltage isn't ~230 V. No dedicated L1/L2/L3 current sensors yet either,
   though `cur` (configured max) is exposed.
-- **set-max-current (`w_mxI`) is untested** — the charging switch has been
-  verified live (see Validation status above); the max-current number
-  hasn't been exercised on real hardware yet.
 - **No lock/unlock, reboot, schedules, or Halo LED control.** (Eco-Smart
   mode is now implemented — see Entities above — though confirmed
   unsupported on the one charger this has been tested against.) The BAPI
